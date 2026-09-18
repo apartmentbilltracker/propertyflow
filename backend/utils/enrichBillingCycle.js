@@ -56,6 +56,160 @@ const waterPreferenceSnapshot = (member) => ({
     : [],
 });
 
+const parseStoredMemberCharges = (charges) => {
+  if (typeof charges === "string") {
+    try {
+      return JSON.parse(charges);
+    } catch (_) {
+      return null;
+    }
+  }
+  return Array.isArray(charges) ? charges : null;
+};
+
+const CHARGE_SHARE_FIELDS = [
+  "rent_share",
+  "electricity_share",
+  "water_bill_share",
+  "internet_share",
+  "custom_charges_share",
+];
+
+const retargetChargeTotal = (charge, targetTotal) => {
+  const nextTotal = r2(targetTotal);
+  const currentWaterShare = parseFloat(charge.water_bill_share) || 0;
+  const currentWaterOwn = parseFloat(charge.water_own) || 0;
+  const currentWaterShared = parseFloat(charge.water_shared_nonpayor) || 0;
+  const currentTotal =
+    parseFloat(charge.total_due) ||
+    CHARGE_SHARE_FIELDS.reduce(
+      (sum, field) => r2(sum + (parseFloat(charge[field]) || 0)),
+      0,
+    );
+
+  if (nextTotal <= 0) {
+    CHARGE_SHARE_FIELDS.forEach((field) => {
+      charge[field] = 0;
+    });
+    charge.water_own = 0;
+    charge.water_shared_nonpayor = 0;
+    charge.total_due = 0;
+    return charge;
+  }
+
+  if (currentTotal <= 0) {
+    CHARGE_SHARE_FIELDS.forEach((field) => {
+      charge[field] = 0;
+    });
+    charge.custom_charges_share = nextTotal;
+    charge.total_due = nextTotal;
+    return charge;
+  }
+
+  let assigned = 0;
+  let lastNonZeroField = null;
+  for (let index = CHARGE_SHARE_FIELDS.length - 1; index >= 0; index--) {
+    const field = CHARGE_SHARE_FIELDS[index];
+    if ((parseFloat(charge[field]) || 0) > 0) {
+      lastNonZeroField = field;
+      break;
+    }
+  }
+  if (!lastNonZeroField) lastNonZeroField = "custom_charges_share";
+
+  CHARGE_SHARE_FIELDS.forEach((field) => {
+    const currentValue = parseFloat(charge[field]) || 0;
+    if (field === lastNonZeroField) {
+      charge[field] = r2(nextTotal - assigned);
+    } else if (currentValue > 0) {
+      charge[field] = r2((currentValue / currentTotal) * nextTotal);
+      assigned = r2(assigned + charge[field]);
+    } else {
+      charge[field] = 0;
+    }
+  });
+
+  charge.total_due = r2(
+    CHARGE_SHARE_FIELDS.reduce(
+      (sum, field) => r2(sum + (parseFloat(charge[field]) || 0)),
+      0,
+    ),
+  );
+
+  const adjustedWaterShare = parseFloat(charge.water_bill_share) || 0;
+  if (currentWaterShare > 0) {
+    const waterRatio = adjustedWaterShare / currentWaterShare;
+    charge.water_own = r2(currentWaterOwn * waterRatio);
+    charge.water_shared_nonpayor = r2(currentWaterShared * waterRatio);
+  } else {
+    charge.water_own = adjustedWaterShare;
+    charge.water_shared_nonpayor = 0;
+  }
+
+  return charge;
+};
+
+const applyStoredTotalOverride = (
+  cycle,
+  memberCharges,
+  computedTotal,
+  storedTotal,
+  enabled,
+) => {
+  const targetTotal = r2(storedTotal);
+  const currentTotal = r2(computedTotal);
+  if (cycle.status !== "active") {
+    return parseFloat(cycle.total_billed_amount || 0) || currentTotal;
+  }
+
+  if (
+    !enabled ||
+    !Number.isFinite(targetTotal) ||
+    targetTotal <= 0 ||
+    Math.abs(targetTotal - currentTotal) < 0.01
+  ) {
+    cycle.total_billed_amount = currentTotal;
+    return currentTotal;
+  }
+
+  const payerCharges = memberCharges.filter((charge) => charge.is_payer !== false);
+  if (payerCharges.length === 0) {
+    cycle.total_billed_amount = currentTotal;
+    return currentTotal;
+  }
+
+  const diff = r2(targetTotal - currentTotal);
+  let assigned = 0;
+  const nextTotals = [];
+  for (let index = 0; index < payerCharges.length; index++) {
+    const share =
+      index === payerCharges.length - 1
+        ? r2(diff - assigned)
+        : r2(diff / payerCharges.length);
+    const nextTotal = r2((parseFloat(payerCharges[index].total_due) || 0) + share);
+    if (nextTotal < 0) {
+      cycle.total_billed_amount = currentTotal;
+      return currentTotal;
+    }
+    nextTotals.push(nextTotal);
+    assigned = r2(assigned + share);
+  }
+
+  payerCharges.forEach((charge, index) => {
+    retargetChargeTotal(charge, nextTotals[index]);
+    charge.manual_total_override = true;
+    charge.total_override_metadata = {
+      stored_total_billed_amount: targetTotal,
+      computed_total_billed_amount: currentTotal,
+      applied_difference: diff,
+    };
+  });
+
+  cycle.member_charges = memberCharges;
+  cycle.total_billed_amount = targetTotal;
+  return targetTotal;
+};
+
 /**
  * Enrich a single billing cycle with computed member charges from presence data.
  * Mutates the cycle object in-place and also returns it.
@@ -64,8 +218,11 @@ const waterPreferenceSnapshot = (member) => ({
  * @param {Array}  [members] - Room members array (fetched if not provided)
  * @returns {Object} The enriched cycle
  */
-async function enrichBillingCycle(cycle, members, roomData) {
+async function enrichBillingCycle(cycle, members, roomData, options = {}) {
   if (!cycle) return cycle;
+  const respectStoredTotalOverride =
+    options.respectStoredTotalOverride !== false;
+  const storedTotalBilledAmount = parseFloat(cycle.total_billed_amount || 0);
 
   // Fetch members if not provided
   if (!members) {
@@ -76,17 +233,36 @@ async function enrichBillingCycle(cycle, members, roomData) {
   // Use the snapshotted member_charges persisted at close time (preserves
   // the original presence-based water split). Only fall back to equal split
   // if no snapshot was stored (legacy cycles closed before this fix).
+  const storedActiveCharges = parseStoredMemberCharges(cycle.member_charges);
+  if (
+    cycle.status === "active" &&
+    Array.isArray(storedActiveCharges) &&
+    storedActiveCharges.some((charge) => charge?.manual_adjustment === true)
+  ) {
+    cycle.member_charges = storedActiveCharges;
+    const adjustedPayerTotal = storedActiveCharges
+      .filter((charge) => charge.is_payer !== false)
+      .reduce(
+        (sum, charge) => r2(sum + (parseFloat(charge.total_due) || 0)),
+        0,
+      );
+    if (adjustedPayerTotal > 0) {
+      cycle.total_billed_amount = adjustedPayerTotal;
+    }
+    applyStoredTotalOverride(
+      cycle,
+      storedActiveCharges,
+      adjustedPayerTotal,
+      storedTotalBilledAmount,
+      respectStoredTotalOverride,
+    );
+    return cycle;
+  }
+
   if (cycle.status === "completed" || cycle.status === "closed") {
     // console.log("[ENRICH] Using completed/closed cycle path");
     // Parse stored member_charges if it's a JSON string
-    let stored = cycle.member_charges;
-    if (typeof stored === "string") {
-      try {
-        stored = JSON.parse(stored);
-      } catch (_) {
-        stored = null;
-      }
-    }
+    let stored = parseStoredMemberCharges(cycle.member_charges);
     if (Array.isArray(stored) && stored.length > 0) {
       // console.log("[ENRICH] Using stored member_charges");
 
@@ -123,6 +299,19 @@ async function enrichBillingCycle(cycle, members, roomData) {
       }));
 
       cycle.member_charges = stored;
+      const storedPayerTotal = stored
+        .filter((charge) => charge.is_payer !== false)
+        .reduce(
+          (sum, charge) => r2(sum + (parseFloat(charge.total_due) || 0)),
+          0,
+        );
+      applyStoredTotalOverride(
+        cycle,
+        stored,
+        storedPayerTotal,
+        storedTotalBilledAmount,
+        respectStoredTotalOverride,
+      );
       return cycle;
     }
     // console.log("[ENRICH] No stored member_charges, falling back to legacy");
@@ -434,6 +623,13 @@ async function enrichBillingCycle(cycle, members, roomData) {
         );
       }
     }
+    applyStoredTotalOverride(
+      cycle,
+      memberCharges,
+      cycle.total_billed_amount,
+      storedTotalBilledAmount,
+      respectStoredTotalOverride,
+    );
     return cycle;
   }
 
@@ -606,6 +802,14 @@ async function enrichBillingCycle(cycle, members, roomData) {
       lastPayer.total_due = r2(lastPayer.total_due + diff);
     }
   }
+
+  applyStoredTotalOverride(
+    cycle,
+    memberCharges,
+    cycle.total_billed_amount,
+    storedTotalBilledAmount,
+    respectStoredTotalOverride,
+  );
 
   return cycle;
 }

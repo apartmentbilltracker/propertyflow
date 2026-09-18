@@ -35,6 +35,12 @@ const getBillMeta = (c) => ({
     bg: c.purpleBg,
     label: "Internet",
   },
+  custom_charges: {
+    icon: "receipt",
+    color: c.textSecondary,
+    bg: c.cardAlt,
+    label: "Additional",
+  },
 });
 
 const formatCurrency = (value) =>
@@ -61,7 +67,6 @@ const AdminAdjustmentsScreen = ({ navigation }) => {
   const [actualCycleId, setActualCycleId] = useState(cycleId);
 
   // Form states
-  const [adjustmentType, setAdjustmentType] = useState("rent"); // rent, electricity, water, internet
   const [adjustmentAmount, setAdjustmentAmount] = useState("");
   const [adjustmentReason, setAdjustmentReason] = useState("");
   const [refundAmount, setRefundAmount] = useState("");
@@ -121,25 +126,27 @@ const AdminAdjustmentsScreen = ({ navigation }) => {
 
   const handleAdjustCharge = async () => {
     if (!selectedMember || !adjustmentAmount || !adjustmentReason.trim()) {
-      Alert.alert("Error", "Please fill all fields");
+      Alert.alert("Error", "Enter the fixed amount and reason");
+      return;
+    }
+
+    const targetAmount = Number(adjustmentAmount);
+    if (!Number.isFinite(targetAmount) || targetAmount < 0) {
+      Alert.alert("Error", "Enter a valid amount");
       return;
     }
 
     try {
       setLoading(true);
-      const adjustmentObj = {};
-      adjustmentObj[`${adjustmentType}Adjustment`] =
-        parseFloat(adjustmentAmount);
-
-      await apiService.put(
-        `/api/v2/admin/billing/adjust-charge/${actualCycleId}/${selectedMember.id || selectedMember._id}`,
+      await apiService.post(
+        `/api/v2/admin/billing/set-member-total/${actualCycleId}/${selectedMember.userId}`,
         {
-          ...adjustmentObj,
+          targetAmount,
           reason: adjustmentReason,
         },
       );
 
-      Alert.alert("Success", "Charge adjusted successfully!");
+      Alert.alert("Success", "Payor total adjusted and redistributed!");
       setAdjustmentModalVisible(false);
       setAdjustmentAmount("");
       setAdjustmentReason("");
@@ -218,6 +225,7 @@ const AdminAdjustmentsScreen = ({ navigation }) => {
     { key: "electricity", field: "electricityShare" },
     { key: "water", field: "waterShare" },
     { key: "internet", field: "internetShare" },
+    { key: "custom_charges", field: "customChargesShare" },
   ];
 
   const payerMembers = useMemo(
@@ -317,6 +325,13 @@ const AdminAdjustmentsScreen = ({ navigation }) => {
         <View style={styles.chargesDetails}>
           {chargeEntries.map(({ key, field }) => {
             const meta = BILL_META[key];
+            if (
+              key === "custom_charges" &&
+              (member[field] || 0) === 0 &&
+              !member.manualAdjustment
+            ) {
+              return null;
+            }
             return (
               <View key={key} style={styles.chargeRow}>
                 <View style={styles.chargeLeft}>
@@ -359,6 +374,18 @@ const AdminAdjustmentsScreen = ({ navigation }) => {
               <Text style={styles.chargeNoteText}>{member.waterShareNote}</Text>
             </View>
           )}
+          {member.manualAdjustment && member.adjustmentMetadata && (
+            <View style={styles.adjustmentNote}>
+              <Ionicons name="git-compare" size={12} color={colors.accent} />
+              <Text style={styles.adjustmentNoteText}>
+                Fixed total applied. Redistributed{" "}
+                {formatCurrency(
+                  member.adjustmentMetadata.redistributed_amount || 0,
+                )}
+                .
+              </Text>
+            </View>
+          )}
         </View>
 
         {/* Actions */}
@@ -380,11 +407,11 @@ const AdminAdjustmentsScreen = ({ navigation }) => {
               }}
             >
               <Ionicons
-                name="construct"
+                name="wallet"
                 size={15}
                 color={colors.textOnAccent}
               />
-              <Text style={styles.actionBtnText}>Adjust</Text>
+              <Text style={styles.actionBtnText}>Set Amount</Text>
             </TouchableOpacity>
 
             <TouchableOpacity
@@ -518,10 +545,10 @@ const AdminAdjustmentsScreen = ({ navigation }) => {
                   { backgroundColor: colors.accentSurface },
                 ]}
               >
-                <Ionicons name="construct" size={20} color={colors.accent} />
+                <Ionicons name="wallet" size={20} color={colors.accent} />
               </View>
               <View>
-                <Text style={styles.modalTitle}>Adjust Charge</Text>
+                <Text style={styles.modalTitle}>Set Payor Total</Text>
                 <Text style={styles.modalSubtitle}>
                   {selectedMember?.memberName}
                 </Text>
@@ -529,45 +556,17 @@ const AdminAdjustmentsScreen = ({ navigation }) => {
             </View>
 
             <View style={styles.form}>
-              <Text style={styles.formLabel}>Bill Type</Text>
-              <View style={styles.typeButtons}>
-                {["rent", "electricity", "water", "internet"].map((type) => {
-                  const meta = BILL_META[type];
-                  const active = adjustmentType === type;
-                  return (
-                    <TouchableOpacity
-                      key={type}
-                      style={[
-                        styles.typeBtn,
-                        active && {
-                          backgroundColor: meta.bg,
-                          borderColor: meta.color,
-                        },
-                      ]}
-                      onPress={() => setAdjustmentType(type)}
-                    >
-                      <Ionicons
-                        name={meta.icon}
-                        size={14}
-                        color={active ? meta.color : "#bbb"}
-                      />
-                      <Text
-                        style={[
-                          styles.typeBtnText,
-                          active && { color: meta.color },
-                        ]}
-                      >
-                        {meta.label}
-                      </Text>
-                    </TouchableOpacity>
-                  );
-                })}
+              <View style={styles.adjustmentInfoBox}>
+                <Text style={styles.adjustmentInfoLabel}>Current total</Text>
+                <Text style={styles.adjustmentInfoAmount}>
+                  {formatCurrency(selectedMember?.totalDue || 0)}
+                </Text>
               </View>
 
               <Text style={styles.formLabel}>Adjustment Amount (₱)</Text>
               <TextInput
                 style={styles.input}
-                placeholder="Enter amount (positive/negative)"
+                placeholder="Example: 2000"
                 keyboardType="decimal-pad"
                 value={adjustmentAmount}
                 onChangeText={setAdjustmentAmount}
@@ -576,7 +575,7 @@ const AdminAdjustmentsScreen = ({ navigation }) => {
               <Text style={styles.formLabel}>Reason</Text>
               <TextInput
                 style={[styles.input, styles.textArea]}
-                placeholder="Explain the adjustment..."
+                placeholder="Example: Moving out early, agreed fixed share"
                 multiline
                 numberOfLines={3}
                 value={adjustmentReason}
@@ -600,7 +599,7 @@ const AdminAdjustmentsScreen = ({ navigation }) => {
                   style={styles.confirmBtn}
                   onPress={handleAdjustCharge}
                 >
-                  <Text style={styles.confirmBtnText}>Apply Adjustment</Text>
+                  <Text style={styles.confirmBtnText}>Redistribute</Text>
                 </TouchableOpacity>
               </View>
               <ModalBottomSpacer />
@@ -1120,6 +1119,22 @@ const createStyles = (colors) =>
       fontStyle: "italic",
       flex: 1,
     },
+    adjustmentNote: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 6,
+      backgroundColor: colors.accentSurface,
+      borderRadius: 8,
+      paddingVertical: 6,
+      paddingHorizontal: 10,
+      marginTop: 8,
+    },
+    adjustmentNoteText: {
+      fontSize: 11,
+      color: colors.accent,
+      fontWeight: "600",
+      flex: 1,
+    },
 
     /* ── Action Buttons ── */
     actionButtons: { flexDirection: "row", gap: 8 },
@@ -1179,6 +1194,27 @@ const createStyles = (colors) =>
     modalTitle: { fontSize: 17, fontWeight: "700", color: colors.text },
     modalSubtitle: { fontSize: 13, color: colors.textTertiary, marginTop: 1 },
     form: { maxHeight: 500 },
+    adjustmentInfoBox: {
+      borderWidth: 1,
+      borderColor: colors.borderLight,
+      borderRadius: 12,
+      backgroundColor: colors.cardAlt,
+      padding: 12,
+      marginBottom: 6,
+    },
+    adjustmentInfoLabel: {
+      fontSize: 11,
+      fontWeight: "700",
+      color: colors.textTertiary,
+      textTransform: "uppercase",
+      letterSpacing: 0.35,
+    },
+    adjustmentInfoAmount: {
+      fontSize: 18,
+      fontWeight: "900",
+      color: colors.accent,
+      marginTop: 4,
+    },
     formLabel: {
       fontSize: 12,
       fontWeight: "600",

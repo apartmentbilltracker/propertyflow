@@ -47,12 +47,24 @@ async function checkAndAutoCloseCycle(roomId) {
     );
 
     // 4. Check each payer - must have paid rent, electricity, water, internet, AND custom_charges if they exist
+    let customCharges = [];
+    if (activeCycle.custom_charges) {
+      try {
+        customCharges = Array.isArray(activeCycle.custom_charges)
+          ? activeCycle.custom_charges
+          : JSON.parse(activeCycle.custom_charges || "[]");
+      } catch (_) {
+        customCharges = [];
+      }
+    }
+
+    const memberCustomChargesExist = (activeCycle.member_charges || []).some(
+      (charge) =>
+        charge.is_payer !== false &&
+        (parseFloat(charge.custom_charges_share) || 0) > 0,
+    );
     const customChargesExist =
-      activeCycle.custom_charges &&
-      (Array.isArray(activeCycle.custom_charges)
-        ? activeCycle.custom_charges.length > 0
-        : typeof activeCycle.custom_charges === "string" &&
-          JSON.parse(activeCycle.custom_charges || "[]").length > 0);
+      customCharges.length > 0 || memberCustomChargesExist;
 
     const allPaid = payingMembers.every((member) => {
       const memberPayments = completedPayments.filter(

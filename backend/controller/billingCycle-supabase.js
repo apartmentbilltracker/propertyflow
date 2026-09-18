@@ -245,6 +245,7 @@ router.post("/", isAuthenticated, async (req, res, next) => {
         water_bill_amount: updWater,
         internet: updInternet,
         members_count: updMembersCount,
+        member_charges: null,
         total_billed_amount:
           parseFloat(updRent) +
           parseFloat(updElec) +

@@ -96,6 +96,30 @@ const normalizeRoom = (room) => {
   return room;
 };
 
+const parseJsonArray = (value) => {
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (_) {
+      return [];
+    }
+  }
+  return [];
+};
+
+const memberRequiresCustomChargePayment = (cycle, memberId) => {
+  if (!cycle) return false;
+  if (parseJsonArray(cycle.custom_charges).length > 0) return true;
+
+  const memberCharges = parseJsonArray(cycle.member_charges);
+  const charge = memberCharges.find(
+    (item) => String(item.user_id) === String(memberId),
+  );
+  return (parseFloat(charge?.custom_charges_share) || 0) > 0;
+};
+
 // Helper: fetch approved members for a room with user details (cached 30s)
 const enrichRoomMembers = async (roomId) => {
   return cache.getOrSet(
@@ -450,6 +474,10 @@ router.get("/client/my-rooms", isAuthenticated, async (req, res, next) => {
             isTotalPaid || mp.some((p) => p.bill_type === "internet");
           const customChargesPaid =
             isTotalPaid || mp.some((p) => p.bill_type === "custom_charges");
+          const customChargesRequired = memberRequiresCustomChargePayment(
+            activeCycle,
+            member.user_id,
+          );
           return {
             member: member.user_id,
             memberName: member.name,
@@ -458,13 +486,14 @@ router.get("/client/my-rooms", isAuthenticated, async (req, res, next) => {
             electricityStatus: elecPaid ? "paid" : "unpaid",
             waterStatus: waterPaid ? "paid" : "unpaid",
             internetStatus: internetPaid ? "paid" : "unpaid",
-            customChargesStatus: customChargesPaid ? "paid" : "unpaid",
+            customChargesStatus:
+              !customChargesRequired || customChargesPaid ? "paid" : "unpaid",
             allPaid:
               rentPaid &&
               elecPaid &&
               waterPaid &&
               internetPaid &&
-              customChargesPaid,
+              (!customChargesRequired || customChargesPaid),
           };
         });
 
@@ -541,6 +570,10 @@ router.get("/client/my-rooms", isAuthenticated, async (req, res, next) => {
               isTotalPaid || mp.some((p) => p.bill_type === "internet");
             const customChargesPaid =
               isTotalPaid || mp.some((p) => p.bill_type === "custom_charges");
+            const customChargesRequired = memberRequiresCustomChargePayment(
+              closedCycle,
+              member.user_id,
+            );
             return {
               member: member.user_id,
               memberName: member.name,
@@ -549,13 +582,14 @@ router.get("/client/my-rooms", isAuthenticated, async (req, res, next) => {
               electricityStatus: elecPaid ? "paid" : "unpaid",
               waterStatus: waterPaid ? "paid" : "unpaid",
               internetStatus: internetPaid ? "paid" : "unpaid",
-              customChargesStatus: customChargesPaid ? "paid" : "unpaid",
+              customChargesStatus:
+                !customChargesRequired || customChargesPaid ? "paid" : "unpaid",
               allPaid:
                 rentPaid &&
                 elecPaid &&
                 waterPaid &&
                 internetPaid &&
-                customChargesPaid,
+                (!customChargesRequired || customChargesPaid),
             };
           });
         }
@@ -982,6 +1016,10 @@ router.get("/:id", async (req, res, next) => {
           isTotalPaid || mp.some((p) => p.bill_type === "internet");
         const customChargesPaid =
           isTotalPaid || mp.some((p) => p.bill_type === "custom_charges");
+        const customChargesRequired = memberRequiresCustomChargePayment(
+          activeCycle,
+          member.user_id,
+        );
         return {
           member: member.user_id,
           memberName: member.name,
@@ -990,13 +1028,14 @@ router.get("/:id", async (req, res, next) => {
           electricityStatus: elecPaid ? "paid" : "unpaid",
           waterStatus: waterPaid ? "paid" : "unpaid",
           internetStatus: internetPaid ? "paid" : "unpaid",
-          customChargesStatus: customChargesPaid ? "paid" : "unpaid",
+          customChargesStatus:
+            !customChargesRequired || customChargesPaid ? "paid" : "unpaid",
           allPaid:
             rentPaid &&
             elecPaid &&
             waterPaid &&
             internetPaid &&
-            customChargesPaid,
+            (!customChargesRequired || customChargesPaid),
         };
       });
 
@@ -1064,6 +1103,10 @@ router.get("/:id", async (req, res, next) => {
             isTotalPaid || mp.some((p) => p.bill_type === "internet");
           const customChargesPaid =
             isTotalPaid || mp.some((p) => p.bill_type === "custom_charges");
+          const customChargesRequired = memberRequiresCustomChargePayment(
+            closedCycle,
+            member.user_id,
+          );
           return {
             member: member.user_id,
             memberName: member.name,
@@ -1072,13 +1115,14 @@ router.get("/:id", async (req, res, next) => {
             electricityStatus: elecPaid ? "paid" : "unpaid",
             waterStatus: waterPaid ? "paid" : "unpaid",
             internetStatus: internetPaid ? "paid" : "unpaid",
-            customChargesStatus: customChargesPaid ? "paid" : "unpaid",
+            customChargesStatus:
+              !customChargesRequired || customChargesPaid ? "paid" : "unpaid",
             allPaid:
               rentPaid &&
               elecPaid &&
               waterPaid &&
               internetPaid &&
-              customChargesPaid,
+              (!customChargesRequired || customChargesPaid),
           };
         });
       }
@@ -1808,7 +1852,9 @@ router.post("/:id/presence", isAuthenticated, async (req, res, next) => {
       if (activeCycle) {
         // Fetch all members fresh (presence just updated) and enrich
         const allMembers = await SupabaseService.getRoomMembers(req.params.id);
-        await enrichBillingCycle(activeCycle, allMembers);
+        await enrichBillingCycle(activeCycle, allMembers, null, {
+          respectStoredTotalOverride: false,
+        });
         const newWater = parseFloat(activeCycle.water_bill_amount) || 0;
         const newTotal = parseFloat(activeCycle.total_billed_amount) || 0;
         await SupabaseService.update("billing_cycles", activeCycle.id, {

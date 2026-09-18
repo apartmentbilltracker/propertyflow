@@ -548,7 +548,8 @@ const BillsScreen = ({ navigation, route }) => {
     const userPayment = getUserPaymentStatus();
     if (!userPayment) return false;
     const hasCustomCharges =
-      activeCycle?.customCharges && activeCycle.customCharges.length > 0;
+      (activeCycle?.customCharges && activeCycle.customCharges.length > 0) ||
+      (billShare?.customCharges || 0) > 0;
     return (
       userPayment.rentStatus === "paid" &&
       userPayment.electricityStatus === "paid" &&
@@ -1106,14 +1107,18 @@ const BillsScreen = ({ navigation, route }) => {
         ];
 
   if (billShare?.customCharges > 0) {
+    const customChargeCount = activeCycle?.customCharges?.length || 0;
     shareItems.push({
-      label: "Custom charges",
+      label: customChargeCount > 0 ? "Custom charges" : "Additional adjustment",
       value: billShare.customCharges,
       icon: activeCycle?.customCharges?.[0]?.name
         ? getCustomChargeIcon(activeCycle.customCharges[0].name)
         : "receipt-long",
       color: colors.textSecondary,
-      note: `${activeCycle?.customCharges?.length || 0} extra charge(s) this cycle`,
+      note:
+        customChargeCount > 0
+          ? `${customChargeCount} extra charge(s) this cycle`
+          : "Redistributed room bill adjustment",
       status: currentPaymentStatus?.customChargesStatus || "unpaid",
     });
   }
