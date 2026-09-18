@@ -212,7 +212,6 @@ const PresenceScreen = () => {
   const [selectedRoom, setSelectedRoom] = useState(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [marking, setMarking] = useState(false);
   const [hasPendingPayment, setHasPendingPayment] = useState(false);
   const pendingUpdatesRef = useRef(new Set());
   const memberRecordIdRef = useRef(null);
@@ -720,14 +719,6 @@ const PresenceScreen = () => {
 
     pendingUpdatesRef.current.clear();
     sendPresence(updatedDates);
-  };
-
-  const markTodayPresence = async () => {
-    if (!hasActiveCycle) {
-      showToast("No active billing cycle. Please contact your admin.", "info");
-      return;
-    }
-    await markPresence(new Date());
   };
 
   const markAllCurrentMonth = async () => {
@@ -1475,34 +1466,6 @@ const PresenceScreen = () => {
                 />
                 <Text style={styles.cardTitle}>Quick Actions</Text>
               </View>
-
-              {/* Primary CTA */}
-              <TouchableOpacity
-                style={[
-                  styles.primaryBtn,
-                  (marking || markingMultiple) && styles.primaryBtnDisabled,
-                ]}
-                onPress={markTodayPresence}
-                disabled={marking || markingMultiple || !hasActiveCycle}
-                activeOpacity={0.82}
-              >
-                {marking || markingMultiple ? (
-                  <ActivityIndicator color={colors.textOnAccent} size={18} />
-                ) : (
-                  <>
-                    <View style={styles.primaryBtnIconWrap}>
-                      <Ionicons
-                        name="checkmark-circle"
-                        size={18}
-                        color={colors.textOnAccent}
-                      />
-                    </View>
-                    <Text style={styles.primaryBtnText}>
-                      Mark Today's Presence
-                    </Text>
-                  </>
-                )}
-              </TouchableOpacity>
 
               {/* Bulk action row */}
               <View style={styles.bulkRow}>

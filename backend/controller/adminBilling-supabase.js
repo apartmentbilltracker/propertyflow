@@ -7,6 +7,109 @@ const ErrorHandler = require("../utils/ErrorHandler");
 const { isAuthenticated, isAdminOrHost } = require("../middleware/auth");
 const { enrichBillingCycle } = require("../utils/enrichBillingCycle");
 
+const r2 = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
+
+const CHARGE_SHARE_FIELDS = [
+  "rent_share",
+  "electricity_share",
+  "water_bill_share",
+  "internet_share",
+  "custom_charges_share",
+];
+
+const parseMemberCharges = (charges) => {
+  if (typeof charges === "string") {
+    try {
+      return JSON.parse(charges);
+    } catch (_) {
+      return [];
+    }
+  }
+  return Array.isArray(charges) ? charges : [];
+};
+
+function setChargeTotal(charge, newTotal) {
+  const targetTotal = r2(newTotal);
+  const currentWaterShare = parseFloat(charge.water_bill_share) || 0;
+  const currentWaterOwn = parseFloat(charge.water_own) || 0;
+  const currentWaterShared = parseFloat(charge.water_shared_nonpayor) || 0;
+  const currentTotal =
+    parseFloat(charge.total_due) ||
+    CHARGE_SHARE_FIELDS.reduce(
+      (sum, field) => r2(sum + (parseFloat(charge[field]) || 0)),
+      0,
+    );
+
+  if (targetTotal <= 0) {
+    CHARGE_SHARE_FIELDS.forEach((field) => {
+      charge[field] = 0;
+    });
+    charge.water_own = 0;
+    charge.water_shared_nonpayor = 0;
+    charge.total_due = 0;
+    return charge;
+  }
+
+  if (currentTotal <= 0) {
+    CHARGE_SHARE_FIELDS.forEach((field) => {
+      charge[field] = 0;
+    });
+    charge.custom_charges_share = targetTotal;
+    charge.total_due = targetTotal;
+    return charge;
+  }
+
+  let assigned = 0;
+  let lastNonZeroField = null;
+  for (let index = CHARGE_SHARE_FIELDS.length - 1; index >= 0; index--) {
+    const field = CHARGE_SHARE_FIELDS[index];
+    if ((parseFloat(charge[field]) || 0) > 0) {
+      lastNonZeroField = field;
+      break;
+    }
+  }
+  if (!lastNonZeroField) lastNonZeroField = "custom_charges_share";
+
+  CHARGE_SHARE_FIELDS.forEach((field) => {
+    const currentValue = parseFloat(charge[field]) || 0;
+    if (field === lastNonZeroField) {
+      charge[field] = r2(targetTotal - assigned);
+    } else if (currentValue > 0) {
+      charge[field] = r2((currentValue / currentTotal) * targetTotal);
+      assigned = r2(assigned + charge[field]);
+    } else {
+      charge[field] = 0;
+    }
+  });
+
+  charge.total_due = r2(
+    CHARGE_SHARE_FIELDS.reduce(
+      (sum, field) => r2(sum + (parseFloat(charge[field]) || 0)),
+      0,
+    ),
+  );
+
+  const adjustedWaterShare = parseFloat(charge.water_bill_share) || 0;
+  if (currentWaterShare > 0) {
+    const waterRatio = adjustedWaterShare / currentWaterShare;
+    charge.water_own = r2(currentWaterOwn * waterRatio);
+    charge.water_shared_nonpayor = r2(currentWaterShared * waterRatio);
+  } else {
+    charge.water_own = adjustedWaterShare;
+    charge.water_shared_nonpayor = 0;
+  }
+  return charge;
+}
+
+function addChargeDeltaToCustom(charge, delta) {
+  const adjustment = r2(delta);
+  charge.custom_charges_share = r2(
+    (parseFloat(charge.custom_charges_share) || 0) + adjustment,
+  );
+  charge.total_due = r2((parseFloat(charge.total_due) || 0) + adjustment);
+  return charge;
+}
+
 // Helper: compute a fallback charge for a member when member_charges is empty
 function computeFallbackCharge(member, billingCycle, payerCount) {
   if (!member.is_payer) {
@@ -42,6 +145,166 @@ function computeFallbackCharge(member, billingCycle, payerCount) {
     total_due: rentShare + electricityShare + waterShare + internetShare,
   };
 }
+
+// Set one payor's total and redistribute the difference equally to the others.
+router.post(
+  "/set-member-total/:cycleId/:memberId",
+  isAuthenticated,
+  isAdminOrHost,
+  catchAsyncErrors(async (req, res, next) => {
+    try {
+      const { cycleId, memberId } = req.params;
+      const rawTargetAmount = req.body.targetAmount ?? req.body.amount;
+      const targetAmount = r2(rawTargetAmount);
+      const reason = String(req.body.reason || "").trim();
+
+      if (
+        rawTargetAmount === undefined ||
+        rawTargetAmount === null ||
+        rawTargetAmount === "" ||
+        !Number.isFinite(Number(rawTargetAmount)) ||
+        targetAmount < 0
+      ) {
+        return next(new ErrorHandler("A valid target amount is required", 400));
+      }
+
+      const billingCycle = await SupabaseService.selectByColumn(
+        "billing_cycles",
+        "id",
+        cycleId,
+      );
+      if (!billingCycle) {
+        return next(new ErrorHandler("Billing cycle not found", 404));
+      }
+      if (billingCycle.status !== "active") {
+        return next(
+          new ErrorHandler("Only active billing cycles can be adjusted", 400),
+        );
+      }
+
+      const room = await SupabaseService.findRoomById(billingCycle.room_id);
+      if (!room) {
+        return next(new ErrorHandler("Room not found", 404));
+      }
+      if (
+        String(room.created_by) !== String(req.user.id) &&
+        (req.user.role || "").toLowerCase() !== "admin" &&
+        req.user.is_admin !== true
+      ) {
+        return next(new ErrorHandler("You can only adjust your own rooms", 403));
+      }
+
+      const members = await SupabaseService.getRoomMembers(
+        billingCycle.room_id,
+      );
+      await enrichBillingCycle(billingCycle, members, room);
+
+      const memberCharges = parseMemberCharges(billingCycle.member_charges).map(
+        (charge) => ({ ...charge }),
+      );
+      const payerCharges = memberCharges.filter(
+        (charge) => charge.is_payer !== false,
+      );
+      const targetCharge = payerCharges.find(
+        (charge) => String(charge.user_id) === String(memberId),
+      );
+      if (!targetCharge) {
+        return next(new ErrorHandler("Selected member is not a payor", 400));
+      }
+
+      const otherPayors = payerCharges.filter(
+        (charge) => String(charge.user_id) !== String(memberId),
+      );
+      const originalTargetTotal = r2(targetCharge.total_due || 0);
+      const redistributionAmount = r2(originalTargetTotal - targetAmount);
+
+      if (redistributionAmount !== 0 && otherPayors.length === 0) {
+        return next(
+          new ErrorHandler(
+            "At least one other payor is required for redistribution",
+            400,
+          ),
+        );
+      }
+
+      const otherTotals = [];
+      let assignedRedistribution = 0;
+      for (let index = 0; index < otherPayors.length; index++) {
+        const share =
+          index === otherPayors.length - 1
+            ? r2(redistributionAmount - assignedRedistribution)
+            : r2(redistributionAmount / otherPayors.length);
+        const nextTotal = r2((otherPayors[index].total_due || 0) + share);
+        if (nextTotal < 0) {
+          return next(
+            new ErrorHandler(
+              "Adjustment would make another payor's total negative",
+              400,
+            ),
+          );
+        }
+        otherTotals.push(nextTotal);
+        assignedRedistribution = r2(assignedRedistribution + share);
+      }
+
+      const adjustmentId = `adj-${Date.now()}`;
+      const appliedAt = new Date().toISOString();
+      const metadata = {
+        id: adjustmentId,
+        type: "fixed_total_redistribution",
+        adjusted_member_id: memberId,
+        adjusted_member_name: targetCharge.name,
+        original_total_due: originalTargetTotal,
+        target_total_due: targetAmount,
+        redistributed_amount: redistributionAmount,
+        reason,
+        applied_by: req.user.id,
+        applied_at: appliedAt,
+      };
+
+      setChargeTotal(targetCharge, targetAmount);
+      otherPayors.forEach((charge, index) => {
+        const currentTotal = r2(charge.total_due || 0);
+        const delta = r2(otherTotals[index] - currentTotal);
+        if (delta >= 0) {
+          addChargeDeltaToCustom(charge, delta);
+        } else {
+          setChargeTotal(charge, otherTotals[index]);
+        }
+      });
+
+      memberCharges.forEach((charge) => {
+        charge.manual_adjustment = true;
+        charge.adjustment_metadata = metadata;
+        if (String(charge.user_id) === String(memberId)) {
+          charge.adjustment_role = "capped_payor";
+        } else if (charge.is_payer !== false) {
+          charge.adjustment_role = "redistributed_payor";
+        }
+      });
+
+      const adjustedTotal = payerCharges.reduce(
+        (sum, charge) => r2(sum + (parseFloat(charge.total_due) || 0)),
+        0,
+      );
+
+      const updatedCycle = await SupabaseService.update("billing_cycles", cycleId, {
+        member_charges: JSON.stringify(memberCharges),
+        total_billed_amount: adjustedTotal,
+      });
+
+      res.status(200).json({
+        success: true,
+        message: "Member total adjusted and redistributed successfully",
+        adjustment: metadata,
+        billingCycle: updatedCycle,
+        memberCharges,
+      });
+    } catch (error) {
+      return next(new ErrorHandler(error.message, 500));
+    }
+  }),
+);
 
 // Get detailed billing breakdown for a cycle
 router.get(
@@ -202,10 +465,12 @@ router.get(
           );
 
           const isTotalPaid = !!totalPayment;
-          const customChargesShare =
-            payerCount > 0
-              ? Number((customChargesTotal / payerCount).toFixed(2))
-              : 0;
+          const customChargesShare = Number(
+            Number(
+              charge.custom_charges_share ??
+                (payerCount > 0 ? customChargesTotal / payerCount : 0),
+            ).toFixed(2),
+          );
 
           return {
             userId: member.user_id,
@@ -219,6 +484,9 @@ router.get(
             waterShare: waterShare,
             internetShare: Number((charge.internet_share || 0).toFixed(2)),
             customChargesShare: customChargesShare,
+            manualAdjustment: charge.manual_adjustment === true,
+            adjustmentRole: charge.adjustment_role || null,
+            adjustmentMetadata: charge.adjustment_metadata || null,
             ownWaterAmount: ownWaterAmount,
             sharedNonPayorWater: sharedNonPayorWater,
             waterShareNote: `Own consumption: ₱${ownWaterAmount} + Non-payer share: ₱${sharedNonPayorWater}`,
@@ -366,10 +634,12 @@ router.get(
           );
 
           const isTotalPaid = !!totalPayment;
-          const customChargesShare =
-            payerCount > 0
-              ? Number((customChargesTotal / payerCount).toFixed(2))
-              : 0;
+          const customChargesShare = Number(
+            Number(
+              charge.custom_charges_share ??
+                (payerCount > 0 ? customChargesTotal / payerCount : 0),
+            ).toFixed(2),
+          );
 
           return {
             userId: member.user_id,
@@ -390,6 +660,9 @@ router.get(
             waterAmount: Number((charge.water_bill_share || 0).toFixed(2)),
             internetAmount: Number((charge.internet_share || 0).toFixed(2)),
             customChargesAmount: customChargesShare,
+            manualAdjustment: charge.manual_adjustment === true,
+            adjustmentRole: charge.adjustment_role || null,
+            adjustmentMetadata: charge.adjustment_metadata || null,
             allPaid:
               !!totalPayment ||
               (!!rentPayment &&
